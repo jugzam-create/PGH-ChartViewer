@@ -1,0 +1,792 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PGH Chart Viewer v3.7.4 TEST</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js">
+
+
+</script><script src="https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js"></script>
+<style>*{box-sizing:border-box}body{background:#10151d;color:#e7edf5;font:15px -apple-system,BlinkMacSystemFont,sans-serif;margin:0;padding:15px}h2{margin:8px 0 3px}.muted{color:#a9b8c9}.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}label{display:block;color:#a9b8c9;font-size:13px}input,select,button{width:100%;padding:12px 7px;border:1px solid #3b5062;border-radius:9px;background:#1c2938;color:#f1f5f9;font-size:16px;margin-top:5px}button{background:#26638d;font-weight:600}button:disabled{opacity:.55}.checks{display:flex;gap:12px;flex-wrap:wrap}.checks label{display:flex;align-items:center;gap:5px}.checks input{width:auto}#info,#status{background:#1c2938;border-radius:9px;padding:12px;margin:12px 0;overflow-wrap:anywhere}#chart{width:100%;height:78vh;min-height:400px}.hint{font-size:12px;color:#a9b8c9}
+#chart .draglayer {
+  touch-action:none;
+}
+</style>
+</head><body>
+<h2>PGH Chart Viewer v3.7.4 TEST</h2><div class="muted">XAUUSD Historical · JST · 2024–2026</div>
+<div class="controls"><label>開始日<input id="start" type="date" value="2026-10-01"></label><label>終了日<input id="end" type="date" value="2026-10-14"></label><label>時間足<select id="tf"><option>M1</option><option>M5</option><option selected>M15</option><option>M30</option><option>H1</option><option>H4</option><option>D1</option></select></label><label>操作<button id="load">チャート更新</button></label></div>
+<div class="checks"><label><input type="checkbox" id="ema20" checked>EMA20</label><label><input type="checkbox" id="ema50" checked>EMA50</label><label><input type="checkbox" id="sma200" checked>SMA200</label></div>
+<div id="status">読み込み待機</div><div id="info">ローソク足をタップすると日時とOHLCを表示</div>
+<div id="gjZoomBar" style="
+display:flex;gap:8px;flex-wrap:wrap;
+margin:12px 0;padding:8px 0">
+<button type="button" onclick="gjZoom(0.5)"
+style="flex:1;min-height:48px;font-size:17px">
+＋ 拡大
+</button>
+<button type="button" onclick="gjZoom(2)"
+style="flex:1;min-height:48px;font-size:17px">
+－ 縮小
+</button>
+<button type="button" onclick="gjZoomReset()"
+style="flex:1;min-height:48px;font-size:17px">
+全体表示
+</button>
+</div>
+<div style="margin:8px 0 12px">
+<button type="button" onclick="gjAutoPrice()">
+価格自動調整
+</button>
+</div>
+
+<div id="gjReplayPanel"
+style="margin:12px 0;padding:12px;
+border:1px solid #34465a;border-radius:10px;
+background:#172330">
+
+<div style="font-weight:bold;margin-bottom:10px">
+PGH Replay — 形成過程モード
+</div>
+
+<div style="display:flex;flex-wrap:wrap;gap:8px;
+align-items:center;margin-bottom:10px">
+
+<label>開始日時（JST）
+<input type="datetime-local" id="gjReplayStart"
+value="2026-10-08T04:00">
+</label>
+
+<button type="button" id="gjReplayInit">
+リプレイ開始
+</button>
+
+<button type="button" id="gjReplayExit">
+通常モード
+</button>
+</div>
+
+<div style="display:flex;flex-wrap:wrap;gap:8px">
+<button type="button" id="gjReplayBack">◀ -1分</button>
+<button type="button" id="gjReplayPlay">▶ 再生</button>
+<button type="button" id="gjReplayNext">+1分 ▶</button>
+<button type="button" id="gjReplayNext10">+10分</button>
+<button type="button" id="gjReplayReset">最初へ</button>
+</div>
+
+<div id="gjReplayStatus"
+style="margin-top:10px;font-size:13px;color:#a9b8c9">
+リプレイ未開始
+</div>
+</div>
+
+<div id="chart"></div><div class="hint">データは過去履歴です。H4はUTC基準（JST 01/05/09/13/17/21時）、D1はJST 00時区切り。市場休場・欠測を補完しません。価格の出所は期間により異なります。</div>
+<script>
+const $=id=>document.getElementById(id);const chart=$('chart');let bars=[];let currentManifest;
+const dateText=s=>s.slice(0,10);const monthRange=(a,b)=>{let result=[];let d=new Date(a+'T00:00:00Z');d.setUTCDate(1);let end=new Date(b+'T00:00:00Z');while(d<=end){result.push(d.toISOString().slice(0,7));d.setUTCMonth(d.getUTCMonth()+1)}return result};
+function ma(vals,n,exponential){let out=[],sum=0,e=null,k=2/(n+1);for(let i=0;i<vals.length;i++){sum+=vals[i];if(i>=n)sum-=vals[i-n];if(exponential){if(i===n-1)e=sum/n;else if(i>=n)e=vals[i]*k+e*(1-k);out.push(e)}else out.push(i>=n-1?sum/n:null)}return out}
+function selected(){return {start:$('start').value,end:$('end').value,tf:$('tf').value}}
+async function load(){let {start,end,tf}=selected();if(!start||!end||start>end){$('status').textContent='日付範囲を確認してください';return}if(!currentManifest){const r=await fetch('manifest.json');if(!r.ok)throw Error('manifest.json を取得できません');currentManifest=await r.json()}
+
+const available=currentManifest.files
+  .filter(f=>f.tf===tf && f.month<=end.slice(0,7))
+  .sort((a,b)=>a.month.localeCompare(b.month));
+
+const selectedMonths=monthRange(start,end);
+const firstMonth=start.slice(0,7);
+const firstIndex=available.findIndex(f=>f.month===firstMonth);
+
+const previousAll=available
+  .filter(f=>f.month<firstMonth);
+
+let previous=[];
+let warmupCount=0;
+
+for(let i=previousAll.length-1;i>=0;i--){
+  const f=previousAll[i];
+  previous.unshift(f);
+  warmupCount+=Number(f.rows||0);
+  if(warmupCount>=1000)break;
+}
+
+const matches=[
+  ...previous,
+  ...available.filter(f=>selectedMonths.includes(f.month))
+];
+if(!matches.length){$('status').textContent='この期間にデータはありません';return}
+$('load').disabled=true;try{let all=[];for(let i=0;i<matches.length;i++){let f=matches[i];$('status').textContent=`読込中 ${i+1}/${matches.length}: ${f.path}`;let response=await fetch(f.path);if(!response.ok)throw Error(f.path+' HTTP '+response.status);let buf=new Uint8Array(await response.arrayBuffer());let csv=window.pako.ungzip(buf,{to:'string'});let lines=csv.trim().split(/\r?\n/);let head=lines.shift().split(',');let idx=['JST','Open','High','Low','Close'].map(x=>head.indexOf(x));if(idx.some(i=>i<0))throw Error('CSV列が不正: '+f.path);for(let line of lines){if(!line)continue;let v=line.split(',');let d=v[idx[0]].slice(0,10);if(d>end)continue;all.push({t:v[idx[0]],o:+v[idx[1]],h:+v[idx[2]],l:+v[idx[3]],c:+v[idx[4]]})}}
+all.sort((a,b)=>a.t.localeCompare(b.t));
+const history=all;
+bars=history.filter(b=>b.t.slice(0,10)>=start);
+if(!bars.length){$('status').textContent='指定期間に足がありません';Plotly.purge(chart);return}
+const x=bars.map(b=>b.t.replace(' ','T'));
+const closes=bars.map(b=>b.c);
+const historyCloses=history.map(b=>b.c);
+const offset=history.length-bars.length;
+const maValues={
+  ema20:ma(historyCloses,20,true).slice(offset),
+  ema50:ma(historyCloses,50,true).slice(offset),
+  sma200:ma(historyCloses,200,false).slice(offset)
+};let traces=[{type:'candlestick',name:'XAUUSD',hoverinfo:'none',x,open:bars.map(b=>b.o),high:bars.map(b=>b.h),low:bars.map(b=>b.l),close:closes,increasing:{line:{color:'#20b99b'}},decreasing:{line:{color:'#e65b68'}}}];for(let [id,n,ex,color] of [['ema20',20,true,'#f5be43'],['ema50',50,true,'#43b6e9'],['sma200',200,false,'#c77df3']])if($(id).checked)traces.push({type:'scatter',mode:'lines',name:id.toUpperCase(),x,y:maValues[id],line:{width:1.5,color},hoverinfo:'skip'});
+await Plotly.react(chart,traces,{paper_bgcolor:'#10151d',plot_bgcolor:'#10151d',font:{color:'#a9b8c9'},margin:{l:50,r:10,t:20,b:85},xaxis:{type:'category',...gjTimeTicks(),rangeslider:{visible:false},gridcolor:'#1c2938'},yaxis:{gridcolor:'#1c2938',fixedrange:false},dragmode:'pan',hovermode:'closest',showlegend:true,legend:{orientation:'h',y:1.1}},{responsive:true,displaylogo:false,displayModeBar:false,scrollZoom:true});
+
+await gjAutoPrice();
+await gjRefreshTimeTicks();
+
+let gjTickTimer=null;
+
+chart.on('plotly_relayout',ev=>{
+  if(gjTickBusy)return;
+
+  const keys=Object.keys(ev || {});
+  const xChanged=keys.some(k=>
+    k==='xaxis.autorange' ||
+    k==='xaxis.range' ||
+    k.startsWith('xaxis.range[')
+  );
+
+  if(!xChanged)return;
+
+  if(gjTickTimer!==null){
+    clearTimeout(gjTickTimer);
+  }
+
+  gjTickTimer=setTimeout(()=>{
+    gjTickTimer=null;
+    gjRefreshTimeTicks().catch(console.error);
+  },120);
+});
+
+chart.removeAllListeners?.('plotly_click');chart.on('plotly_click',ev=>{let p=ev.points.find(p=>p.curveNumber===0);if(!p)return;let b=bars[p.pointNumber];if(b)$('info').textContent=`${b.t} JST | ${tf} | O ${b.o.toFixed(3)} H ${b.h.toFixed(3)} L ${b.l.toFixed(3)} C ${b.c.toFixed(3)}
+ | EMA20 ${maValues.ema20[p.pointNumber]?.toFixed(3)??'—'}
+ | EMA50 ${maValues.ema50[p.pointNumber]?.toFixed(3)??'—'}
+ | SMA200 ${maValues.sma200[p.pointNumber]?.toFixed(3)??'—'}`});$('status').textContent=`${tf} / ${bars.length.toLocaleString()}本 / ${start} ～ ${end}`;
+}catch(e){$('status').textContent='ERROR: '+e.message;console.error(e)}finally{$('load').disabled=false}}
+$('load').onclick=load;for(let id of ['ema20','ema50','sma200'])$(id).onchange=()=>{if(bars.length)load()};load().catch(e=>$('status').textContent='ERROR: '+e.message);
+
+let gjPinchStart=null;
+
+function gjVisibleIndices(){
+  if(!bars.length)return [];
+  const range=chart.layout?.xaxis?.range;
+  if(!range || range.length!==2)
+    return bars.map((_,i)=>i);
+
+  const a=Math.max(0,Math.floor(Number(range[0])));
+  const b=Math.min(bars.length-1,Math.ceil(Number(range[1])));
+  if(!Number.isFinite(a)||!Number.isFinite(b))
+    return bars.map((_,i)=>i);
+
+  const out=[];
+  for(let i=a;i<=b;i++)out.push(i);
+  return out;
+}
+
+async function gjAutoPrice(){
+  if(!bars.length)return;
+  const ids=gjVisibleIndices();
+  if(!ids.length)return;
+
+  let lo=Infinity,hi=-Infinity;
+  for(const i of ids){
+    lo=Math.min(lo,bars[i].l);
+    hi=Math.max(hi,bars[i].h);
+  }
+
+  if(!Number.isFinite(lo)||!Number.isFinite(hi))return;
+  const pad=Math.max((hi-lo)*0.12,0.5);
+  await Plotly.relayout(chart,{
+    'yaxis.range':[lo-pad,hi+pad],
+    'yaxis.autorange':false
+  });
+}
+
+function gjPinchDistance(touches){
+  const a=touches[0],b=touches[1];
+  return {
+    dx:Math.abs(a.clientX-b.clientX),
+    dy:Math.abs(a.clientY-b.clientY)
+  };
+}
+
+function gjInstallTouch(){
+  if(chart.dataset.gjTouchInstalled)return;
+  chart.dataset.gjTouchInstalled="1";
+
+  chart.addEventListener('touchstart',e=>{
+    if(e.touches.length!==2)return;
+
+    const d=gjPinchDistance(e.touches);
+    const xa=chart.layout?.xaxis?.range;
+    const ya=chart.layout?.yaxis?.range;
+
+    if(!xa||!ya)return;
+
+    gjPinchStart={
+      dx:Math.max(d.dx,1),
+      dy:Math.max(d.dy,1),
+      xr:xa.map(Number),
+      yr:ya.map(Number)
+    };
+  },{passive:true});
+
+  chart.addEventListener('touchmove',e=>{
+    if(e.touches.length!==2||!gjPinchStart)return;
+    e.preventDefault();
+
+    const d=gjPinchDistance(e.touches);
+    const s=gjPinchStart;
+
+    const fx=Math.max(0.15,Math.min(8,d.dx/s.dx));
+    const fy=Math.max(0.15,Math.min(8,d.dy/s.dy));
+
+    const xm=(s.xr[0]+s.xr[1])/2;
+    const ym=(s.yr[0]+s.yr[1])/2;
+    const xhalf=(s.xr[1]-s.xr[0])/(2*fx);
+    const yhalf=(s.yr[1]-s.yr[0])/(2*fy);
+
+    Plotly.relayout(chart,{
+      'xaxis.range':[xm-xhalf,xm+xhalf],
+      'yaxis.range':[ym-yhalf,ym+yhalf],
+      'yaxis.autorange':false
+    });
+  },{passive:false});
+
+  chart.addEventListener('touchend',e=>{
+    if(e.touches.length<2)gjPinchStart=null;
+  },{passive:true});
+
+  chart.addEventListener('touchcancel',()=>{
+    gjPinchStart=null;
+  },{passive:true});
+}
+
+gjInstallTouch();
+
+
+
+function gjTimeTicks(){
+  if(!bars.length){
+    return {tickmode:'auto',nticks:6};
+  }
+
+  const n=bars.length;
+  const step=Math.max(1,Math.ceil(n/6));
+
+  const tickvals=[];
+  const ticktext=[];
+
+  for(let i=0;i<n;i+=step){
+    const t=String(bars[i].t);
+    tickvals.push(i);
+    ticktext.push(
+      t.slice(5,10)+"<br>"+t.slice(11,16)
+    );
+  }
+
+  return {
+    tickmode:'array',
+    tickvals,
+    ticktext,
+    tickangle:0,
+    tickfont:{size:11},
+    showticklabels:true,
+    automargin:true
+  };
+}
+
+let gjTickBusy=false;
+
+async function gjRefreshTimeTicks(){
+  if(gjTickBusy || !bars.length)return;
+
+  const axis=chart._fullLayout?.xaxis;
+  if(!axis)return;
+
+  const range=axis.range || [-0.5,bars.length-0.5];
+
+  const left=Math.max(0,Math.floor(Number(range[0])));
+  const right=Math.min(
+    bars.length-1,
+    Math.ceil(Number(range[1]))
+  );
+
+  if(!Number.isFinite(left) ||
+     !Number.isFinite(right) ||
+     right<left)return;
+
+  const step=Math.max(
+    1,Math.ceil((right-left+1)/6)
+  );
+
+  const tickvals=[];
+  const ticktext=[];
+
+  for(let i=left;i<=right;i+=step){
+    const t=String(bars[i].t);
+    tickvals.push(i);
+    ticktext.push(
+      t.slice(5,10)+"<br>"+t.slice(11,16)
+    );
+  }
+
+  gjTickBusy=true;
+  try{
+    await Plotly.relayout(chart,{
+      'xaxis.tickmode':'array',
+      'xaxis.tickvals':tickvals,
+      'xaxis.ticktext':ticktext,
+      'xaxis.tickangle':0,
+      'xaxis.showticklabels':true
+    });
+  }finally{
+    gjTickBusy=false;
+  }
+}
+
+</script>
+<script>
+function gjCurrentRange() {
+  const gd = document.getElementById('chart');
+  const n = Array.isArray(gd.data) && gd.data.length
+    ? gd.data[0].x.length : 0;
+  if (!n) return null;
+
+  const axis = gd._fullLayout && gd._fullLayout.xaxis;
+  let a = axis && axis.range ? Number(axis.range[0]) : -0.5;
+  let b = axis && axis.range ? Number(axis.range[1]) : n-0.5;
+
+  if (!Number.isFinite(a) || !Number.isFinite(b)) {
+    a = -0.5;
+    b = n-0.5;
+  }
+  return {gd,n,a,b};
+}
+
+async function gjZoom(factor) {
+  const r = gjCurrentRange();
+  if (!r) return;
+
+  const {gd,n,a,b} = r;
+  const width = Math.max(5, Math.min(n,b-a));
+  const newWidth = Math.max(5, Math.min(n,width*factor));
+  const center = (a+b)/2;
+
+  let left = center-newWidth/2;
+  left = Math.max(-0.5,Math.min(left,n-0.5-newWidth));
+
+  await Plotly.relayout(gd,{
+    'xaxis.range':[left,left+newWidth],
+    'xaxis.autorange':false
+  });
+}
+
+async function gjZoomReset() {
+  const r = gjCurrentRange();
+  if (!r) return;
+  await Plotly.relayout(r.gd,{
+    'xaxis.autorange':true
+  });
+}
+</script>
+
+
+<script>
+/* PGH_REPLAY_ENGINE_V371 */
+
+let gjReplayActive = false;
+let gjReplayFirstRender = true;
+let gjReplayTimer = null;
+let gjReplayM1 = [];
+let gjReplayCursor = 0;
+let gjReplayInitial = 0;
+let gjReplayHistory = [];
+let gjReplayTF = "M15";
+
+const gjReplayMinutes = {
+  M1:1,M5:5,M15:15,M30:30,
+  H1:60,H4:240,D1:1440
+};
+
+function gjReplayBucket(t,tf){
+  const d = new Date(t.replace(" ","T")+"+09:00");
+  const ms = d.getTime();
+  const mins = gjReplayMinutes[tf];
+
+  // H4: UTC基準（JST 01/05/09/13/17/21時）
+  let origin = 0;
+  if(tf==="H4")origin=60;
+
+  // JST基準の分番号
+  const jstMinutes = Math.floor(
+    (ms+9*3600000)/60000
+  );
+
+  const bucket = Math.floor(
+    (jstMinutes-origin)/mins
+  )*mins+origin;
+
+  const utcMs = bucket*60000-9*3600000;
+  const x = new Date(utcMs+9*3600000);
+
+  return x.toISOString().slice(0,16).replace("T"," ")+":00";
+}
+
+function gjReplayAggregate(rows,tf){
+  const result=[];
+  for(const b of rows){
+    const key=gjReplayBucket(b.t,tf);
+    let x=result[result.length-1];
+
+    if(!x || x.t!==key){
+      result.push({
+        t:key,o:b.o,h:b.h,l:b.l,c:b.c
+      });
+    }else{
+      x.h=Math.max(x.h,b.h);
+      x.l=Math.min(x.l,b.l);
+      x.c=b.c;
+    }
+  }
+  return result;
+}
+
+async function gjReplayLoadM1(start,end){
+  if(!currentManifest){
+    const r=await fetch("manifest.json");
+    if(!r.ok)throw Error("manifest取得失敗");
+    currentManifest=await r.json();
+  }
+
+  const months=monthRange(start,end);
+
+  // MAウォームアップ用に前月を含める
+  const first=start.slice(0,7);
+  const previous=currentManifest.files
+    .filter(f=>f.tf==="M1" && f.month<first)
+    .sort((a,b)=>b.month.localeCompare(a.month))
+    .slice(0,1);
+
+  const files=[
+    ...previous,
+    ...currentManifest.files.filter(
+      f=>f.tf==="M1" && months.includes(f.month)
+    )
+  ].sort((a,b)=>a.month.localeCompare(b.month));
+
+  let all=[];
+
+  for(let i=0;i<files.length;i++){
+    const f=files[i];
+    $("gjReplayStatus").textContent=
+      `M1読込中 ${i+1}/${files.length}`;
+
+    const response=await fetch(f.path);
+    if(!response.ok)throw Error(f.path);
+
+    const buf=new Uint8Array(
+      await response.arrayBuffer()
+    );
+    const csv=window.pako.ungzip(
+      buf,{to:"string"}
+    );
+    const lines=csv.trim().split(/\r?\n/);
+    const head=lines.shift().split(",");
+    const idx=["JST","Open","High","Low","Close"]
+      .map(x=>head.indexOf(x));
+
+    if(idx.some(x=>x<0))throw Error("CSV列不正");
+
+    for(const line of lines){
+      if(!line)continue;
+      const v=line.split(",");
+      if(v[idx[0]].slice(0,10)>end)continue;
+
+      all.push({
+        t:v[idx[0]],
+        o:+v[idx[1]],
+        h:+v[idx[2]],
+        l:+v[idx[3]],
+        c:+v[idx[4]]
+      });
+    }
+  }
+
+  all.sort((a,b)=>a.t.localeCompare(b.t));
+  return all;
+}
+
+async function gjReplayRender(){
+  if(!gjReplayActive)return;
+
+  const visible=gjReplayM1.slice(
+    0,gjReplayCursor+1
+  );
+
+  const aggregated=gjReplayAggregate(
+    visible,gjReplayTF
+  );
+
+  const start=$("start").value;
+  const history=aggregated;
+  const shown=history.filter(
+    b=>b.t.slice(0,10)>=start
+  );
+
+  if(!shown.length){
+    $("gjReplayStatus").textContent=
+      "表示可能な足がありません";
+    return;
+  }
+
+  bars=shown;
+
+  const closes=history.map(b=>b.c);
+  const offset=history.length-shown.length;
+
+  const maValues={
+    ema20:ma(closes,20,true).slice(offset),
+    ema50:ma(closes,50,true).slice(offset),
+    sma200:ma(closes,200,false).slice(offset)
+  };
+
+  const x=shown.map(b=>b.t.replace(" ","T"));
+
+  const traces=[{
+    type:"candlestick",
+    name:"XAUUSD",
+    hoverinfo:"none",
+    x,
+    open:shown.map(b=>b.o),
+    high:shown.map(b=>b.h),
+    low:shown.map(b=>b.l),
+    close:shown.map(b=>b.c),
+    increasing:{line:{color:"#20b99b"}},
+    decreasing:{line:{color:"#e65b68"}}
+  }];
+
+  for(const [id,color] of [
+    ["ema20","#f5be43"],
+    ["ema50","#43b6e9"],
+    ["sma200","#c77df3"]
+  ]){
+    if($(id).checked){
+      traces.push({
+        type:"scatter",
+        mode:"lines",
+        name:id.toUpperCase(),
+        x,
+        y:maValues[id],
+        line:{width:1.5,color},
+        hoverinfo:"skip"
+      });
+    }
+  }
+
+  // 現在の表示範囲を保存
+  const oldX = chart._fullLayout?.xaxis;
+  const oldY = chart._fullLayout?.yaxis;
+
+  const savedX = oldX?.range?.map(Number);
+  const savedY = oldY?.range?.map(Number);
+
+  const keepX = !gjReplayFirstRender &&
+    savedX?.length === 2 &&
+    savedX.every(Number.isFinite);
+
+  const keepY = !gjReplayFirstRender &&
+    savedY?.length === 2 &&
+    savedY.every(Number.isFinite);
+
+  await Plotly.react(chart,traces,{
+    paper_bgcolor:"#10151d",
+    plot_bgcolor:"#10151d",
+    font:{color:"#a9b8c9"},
+    margin:{l:50,r:10,t:20,b:85},
+    xaxis:{
+      type:"category",
+      ...gjTimeTicks(),
+      rangeslider:{visible:false},
+      gridcolor:"#1c2938"
+    },
+    yaxis:{
+      gridcolor:"#1c2938",
+      fixedrange:false
+    },
+    dragmode:"pan",
+    hovermode:"closest",
+    showlegend:true,
+    legend:{orientation:"h",y:1.1}
+  },{
+    responsive:true,
+    displayModeBar:false
+  });
+
+  // ズーム状態を復元
+  if(keepX || keepY){
+    const update = {};
+
+    if(keepX){
+      const width = Math.max(5, savedX[1]-savedX[0]);
+      const lastIndex = shown.length-1;
+
+      let left = savedX[0];
+      let right = savedX[1];
+
+      // 最新足が右端に近づいたら表示範囲を移動
+      const margin = Math.max(2, Math.min(10, width*0.12));
+
+      if(lastIndex > right-margin){
+        right = lastIndex+margin;
+        left = right-width;
+      }
+
+      update["xaxis.range"] = [left,right];
+      update["xaxis.autorange"] = false;
+    }
+
+    if(keepY){
+      update["yaxis.range"] = savedY;
+      update["yaxis.autorange"] = false;
+    }
+
+    await Plotly.relayout(chart,update);
+  }else{
+    if(gjReplayFirstRender){
+      await Plotly.relayout(chart,{
+        "xaxis.autorange":true
+      });
+    }
+    await gjAutoPrice();
+  }
+
+  gjReplayFirstRender = false;
+  await gjRefreshTimeTicks();
+
+  const last=visible[visible.length-1];
+  const forming=shown[shown.length-1];
+
+  $("gjReplayStatus").textContent=
+    `再生: ${last.t} JST | ${gjReplayTF}`
+    +` | O ${forming.o.toFixed(3)}`
+    +` H ${forming.h.toFixed(3)}`
+    +` L ${forming.l.toFixed(3)}`
+    +` C ${forming.c.toFixed(3)}`;
+}
+
+function gjReplayPause(){
+  if(gjReplayTimer!==null){
+    clearInterval(gjReplayTimer);
+    gjReplayTimer=null;
+  }
+  $("gjReplayPlay").textContent="▶ 再生";
+}
+
+async function gjReplayStep(n){
+  if(!gjReplayActive)return;
+
+  gjReplayCursor=Math.max(
+    gjReplayInitial,
+    Math.min(
+      gjReplayM1.length-1,
+      gjReplayCursor+n
+    )
+  );
+
+  await gjReplayRender();
+
+  if(gjReplayCursor===gjReplayM1.length-1){
+    gjReplayPause();
+  }
+}
+
+async function gjReplayInit(){
+  gjReplayPause();
+
+  const startTime=$("gjReplayStart").value;
+  if(!startTime){
+    alert("開始日時を指定してください");
+    return;
+  }
+
+  const start=$("start").value;
+  const end=$("end").value;
+  const tf=$("tf").value;
+
+  if(!start || !end || start>end){
+    alert("表示期間を確認してください");
+    return;
+  }
+
+  const selectedTime=startTime.replace("T"," ");
+
+  if(selectedTime.slice(0,10)<start ||
+     selectedTime.slice(0,10)>end){
+    alert("開始日時は表示期間内にしてください");
+    return;
+  }
+
+  try{
+    $("gjReplayInit").disabled=true;
+    gjReplayTF=tf;
+
+    gjReplayM1=await gjReplayLoadM1(
+      start,end
+    );
+
+    gjReplayCursor=gjReplayM1.findIndex(
+      b=>b.t>=selectedTime
+    );
+
+    if(gjReplayCursor<0){
+      throw Error("指定日時以降にM1がありません");
+    }
+
+    gjReplayInitial=gjReplayCursor;
+    gjReplayActive=true;
+    gjReplayFirstRender=true;
+
+    await gjReplayRender();
+
+  }catch(e){
+    gjReplayActive=false;
+    $("gjReplayStatus").textContent=
+      "ERROR: "+e.message;
+    console.error(e);
+  }finally{
+    $("gjReplayInit").disabled=false;
+  }
+}
+
+$("gjReplayInit").onclick=gjReplayInit;
+
+$("gjReplayNext").onclick=()=>gjReplayStep(1);
+$("gjReplayNext10").onclick=()=>gjReplayStep(10);
+$("gjReplayBack").onclick=()=>gjReplayStep(-1);
+
+$("gjReplayReset").onclick=async()=>{
+  gjReplayPause();
+  gjReplayCursor=gjReplayInitial;
+  await gjReplayRender();
+};
+
+$("gjReplayPlay").onclick=()=>{
+  if(!gjReplayActive)return;
+
+  if(gjReplayTimer!==null){
+    gjReplayPause();
+    return;
+  }
+
+  $("gjReplayPlay").textContent="⏸ 停止";
+
+  gjReplayTimer=setInterval(()=>{
+    gjReplayStep(1).catch(console.error);
+  },500);
+};
+
+$("gjReplayExit").onclick=async()=>{
+  gjReplayPause();
+  gjReplayActive=false;
+  $("gjReplayStatus").textContent="通常モード";
+  await load();
+};
+
+</script>
+
+</body></html>
